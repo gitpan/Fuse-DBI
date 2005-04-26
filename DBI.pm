@@ -12,8 +12,10 @@ use DBI;
 use Carp;
 use Data::Dumper;
 
+our $VERSION = '0.08';
 
-our $VERSION = '0.07';
+# block size for this filesystem
+use constant BLOCK => 1024;
 
 =head1 NAME
 
@@ -132,6 +134,11 @@ sub mount {
 
 	print Dumper($arg);
 
+	unless ($self->fuse_module_loaded) {
+		print STDERR "no fuse module loaded. Trying sudo modprobe fuse!\n";
+		system "sudo modprobe fuse" || die "can't modprobe fuse using sudo!\n";
+	}
+
 	carp "mount needs 'dsn' to connect to (e.g. dsn => 'DBI:Pg:dbname=test')" unless ($arg->{'dsn'});
 	carp "mount needs 'mount' as mountpoint" unless ($arg->{'mount'});
 
@@ -242,7 +249,11 @@ sub umount {
 	my $self = shift;
 
 	if ($self->{'mount'} && $self->is_mounted) {
-		system "fusermount -u ".$self->{'mount'}." 2>&1 >/dev/null" || return 0;
+		system "( fusermount -u ".$self->{'mount'}." 2>&1 ) >/dev/null";
+		if ($self->is_mounted) {
+			system "sudo umount ".$self->{'mount'} ||
+			return 0;
+		}
 		return 1;
 	}
 
@@ -290,7 +301,6 @@ sub fuse_module_loaded {
 }
 
 my %files;
-my %dirs;
 
 sub read_filenames {
 	my $self = shift;
@@ -319,18 +329,19 @@ sub read_filenames {
 
 	# read them in with sesible defaults
 	while (my $row = $sth->{'filenames'}->fetchrow_hashref() ) {
+		$row->{'filename'} ||= 'NULL-'.$row->{'id'};
 		$files{$row->{'filename'}} = {
 			size => $row->{'size'},
 			mode => $row->{'writable'} ? 0644 : 0444,
 			id => $row->{'id'} || 99,
 		};
 
+
 		my $d;
 		foreach (split(m!/!, $row->{'filename'})) {
 			# first, entry is assumed to be file
 			if ($d) {
 				$files{$d} = {
-						size => $dirs{$d}++,
 						mode => 0755,
 						type => 0040
 				};
@@ -348,7 +359,7 @@ sub read_filenames {
 		}
 	}
 
-	print "found ",scalar(keys %files)-scalar(keys %dirs)," files, ",scalar(keys %dirs), " dirs\n";
+	print "found ",scalar(keys %files)," files\n";
 }
 
 
@@ -364,8 +375,8 @@ sub e_getattr {
 	$file =~ s,^/,,;
 	$file = '.' unless length($file);
 	return -ENOENT() unless exists($files{$file});
-	my ($size) = $files{$file}{size} || 1;
-	my ($dev, $ino, $rdev, $blocks, $gid, $uid, $nlink, $blksize) = (0,0,0,1,0,0,1,1024);
+	my ($size) = $files{$file}{size} || 0;
+	my ($dev, $ino, $rdev, $blocks, $gid, $uid, $nlink, $blksize) = (0,0,0,int(($size+BLOCK-1)/BLOCK),0,0,1,BLOCK);
 	my ($atime, $ctime, $mtime);
 	$atime = $ctime = $mtime = $files{$file}{ctime} || $ctime_start;
 
@@ -373,7 +384,7 @@ sub e_getattr {
 
 	# 2 possible types of return values:
 	#return -ENOENT(); # or any other error you care to
-	#print(join(",",($dev,$ino,$modes,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks)),"\n");
+	#print "getattr($file) ",join(",",($dev,$ino,$modes,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks)),"\n";
 	return ($dev,$ino,$modes,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
 }
 
@@ -423,6 +434,7 @@ sub e_open {
 
 	read_content($file,$files{$file}{id}) unless exists($files{$file}{cont});
 
+	$files{$file}{cont} ||= '';
 	print "open '$file' ",length($files{$file}{cont})," bytes\n";
 	return 0;
 }
@@ -538,17 +550,37 @@ sub e_utime {
 	return 0;
 }
 
-sub e_statfs { return 255, 1, 1, 1, 1, 2 }
+sub e_statfs {
+
+	my $size = 0;
+	my $inodes = 0;
+
+	foreach my $f (keys %files) {
+		if ($f !~ /(^|\/)\.\.?$/) {
+			$size += $files{$f}{size} || 0;
+			$inodes++;
+		}
+		print "$inodes: $f [$size]\n";
+	}
+
+	$size = int(($size+BLOCK-1)/BLOCK);
+
+	my @ret = (255, $inodes, 1, $size, $size-1, BLOCK);
+
+	#print "statfs: ",join(",",@ret),"\n";
+
+	return @ret;
+}
 
 sub e_unlink {
 	my $file = filename_fixup(shift);
 
-	if (exists( $dirs{$file} )) {
-		print "unlink '$file' will re-read template names\n";
-		print Dumper($fuse_self);
-		$$fuse_self->{'read_filenames'}->();
-		return 0;
-	} elsif (exists( $files{$file} )) {
+#	if (exists( $dirs{$file} )) {
+#		print "unlink '$file' will re-read template names\n";
+#		print Dumper($fuse_self);
+#		$$fuse_self->{'read_filenames'}->();
+#		return 0;
+	if (exists( $files{$file} )) {
 		print "unlink '$file' will invalidate cache\n";
 		read_content($file,$files{$file}{id});
 		return 0;
